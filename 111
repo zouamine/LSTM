@@ -1,0 +1,161 @@
+import os
+from tqdm import tqdm
+import numpy as np
+import librosa
+import pandas as pd
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, LSTM, Flatten
+from tensorflow.keras.utils import to_categorical
+from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+from imblearn.over_sampling import SMOTE
+
+# Function to extract MFCC features from a wav file with padding and truncation
+def extract_features(file_name, sr=44100, duration=10):
+    try:
+        audio, sample_rate = librosa.load(file_name, sr=sr)
+        if len(audio) > sr * duration:
+            audio = audio[:sr * duration]
+        elif len(audio) < sr * duration:
+            padding = sr * duration - len(audio)
+            audio = np.pad(audio, (0, padding), 'constant')
+        mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=13)
+        return mfccs.T
+    except Exception as e:
+        print(f"Error encountered while parsing file: {file_name}, error: {e}")
+        return None
+
+# Helper function to process files in a directory
+def process_directory(directory, label):
+    features, labels = [], []
+    if not os.path.exists(directory):
+        print(f"Directory not found: {directory}")
+        return np.array(features), np.array(labels)
+    
+    for file_name in tqdm(os.listdir(directory)):
+        file_path = os.path.join(directory, file_name)
+        if not os.path.isfile(file_path):
+            print(f"File not found: {file_path}")
+            continue
+        data = extract_features(file_path)
+        if data is not None:
+            features.append(data)
+            labels.append(label)
+    return np.array(features), np.array(labels)
+
+# Paths to the directories
+train_healthy_dir = 'D:/deep_learning_v4/dataset_split/train/healthy_audio'
+train_parkinson_dir = 'D:/deep_learning_v4/dataset_split/train/parkinson_audio'
+val_healthy_dir = 'D:/deep_learning_v4/dataset_split/val/healthy_audio'
+val_parkinson_dir = 'D:/deep_learning_v4/dataset_split/val/parkinson_audio'
+test_healthy_dir = 'D:/deep_learning_v4/dataset_split/test/healthy_audio'
+test_parkinson_dir = 'D:/deep_learning_v4/dataset_split/test/parkinson_audio'
+
+# Process directories
+train_features_0, train_labels_0 = process_directory(train_healthy_dir, 0)
+train_features_1, train_labels_1 = process_directory(train_parkinson_dir, 1)
+val_features_0, val_labels_0 = process_directory(val_healthy_dir, 0)
+val_features_1, val_labels_1 = process_directory(val_parkinson_dir, 1)
+test_features_0, test_labels_0 = process_directory(test_healthy_dir, 0)
+test_features_1, test_labels_1 = process_directory(test_parkinson_dir, 1)
+
+# Combine features and labels
+train_features = np.vstack((train_features_0, train_features_1))
+train_labels = np.hstack((train_labels_0, train_labels_1))
+val_features = np.vstack((val_features_0, val_features_1))
+val_labels = np.hstack((val_labels_0, val_labels_1))
+test_features = np.vstack((test_features_0, test_features_1))
+test_labels = np.hstack((test_labels_0, test_labels_1))
+
+# Prepare the data for SMOTE (flattening the features for SMOTE)
+n_samples, n_timesteps, n_features = train_features.shape
+train_features_reshaped = train_features.reshape((n_samples, n_timesteps * n_features))
+
+# Apply SMOTE
+smote = SMOTE()
+train_features_resampled, train_labels_resampled = smote.fit_resample(train_features_reshaped, train_labels)
+
+# Reshape the data back to the 3D format required by the LSTM
+train_features_resampled = train_features_resampled.reshape((-1, n_timesteps, n_features))
+
+# Prepare the data for model input
+def prepare_data(features, labels):
+    labels = to_categorical(labels, num_classes=2)
+    return features, labels
+
+X_train, y_train = prepare_data(train_features_resampled, train_labels_resampled)
+X_val, y_val = prepare_data(val_features, val_labels)
+X_test, y_test = prepare_data(test_features, test_labels)
+
+# Function to get the LSTM model
+def get_lstm_model(input_shape):
+    model = Sequential()
+    model.add(LSTM(64, return_sequences=True, input_shape=(input_shape[1], input_shape[2])))
+    model.add(LSTM(128))
+    model.add(Dropout(0.5))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dense(2, activation='softmax'))
+    model.summary()
+    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    return model
+
+# Model 1 without SMOTE
+input_shape = (X_train.shape[0], X_train.shape[1], X_train.shape[2])
+model1 = get_lstm_model(input_shape)
+history1 = model1.fit(X_train, y_train, epochs=20, batch_size=32, validation_data=(X_val, y_val))
+model1.evaluate(X_test, y_test)
+
+# Predict probabilities for model 1
+y_pred_proba_model1 = model1.predict(X_test)
+
+# Model 2 with SMOTE
+input_shape = (X_train.shape[0], X_train.shape[1], X_train.shape[2])
+model2 = get_lstm_model(input_shape)
+history2 = model2.fit(X_train, y_train, epochs=20, batch_size=32, validation_data=(X_val, y_val))
+model2.evaluate(X_test, y_test)
+
+# Predict probabilities for model 2
+y_pred_proba_model2 = model2.predict(X_test)
+
+# Compute ROC curve and ROC area for model 1
+fpr1, tpr1, _ = roc_curve(y_test[:, 1], y_pred_proba_model1[:, 1])
+roc_auc1 = auc(fpr1, tpr1)
+
+# Compute ROC curve and ROC area for model 2
+fpr2, tpr2, _ = roc_curve(y_test[:, 1], y_pred_proba_model2[:, 1])
+roc_auc2 = auc(fpr2, tpr2)
+
+# Plot ROC curves for both models
+plt.figure()
+plt.plot(fpr1, tpr1, color='darkorange', lw=2, label=f'Model 1 ROC curve (area = {roc_auc1:.2f})')
+plt.plot(fpr2, tpr2, color='blue', lw=2, label=f'Model 2 ROC curve (area = {roc_auc2:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic')
+plt.legend(loc="lower right")
+plt.show()
+
+# Compute confusion matrix for model 1
+y_pred_model1 = np.argmax(y_pred_proba_model1, axis=1)
+y_true = np.argmax(y_test, axis=1)
+cm1 = confusion_matrix(y_true, y_pred_model1)
+
+# Plot confusion matrix for model 1
+disp1 = ConfusionMatrixDisplay(confusion_matrix=cm1, display_labels=['Healthy', 'Parkinson'])
+disp1.plot(cmap=plt.cm.Blues)
+plt.title('Confusion Matrix for Model 1')
+plt.show()
+
+# Compute confusion matrix for model 2
+y_pred_model2 = np.argmax(y_pred_proba_model2, axis=1)
+cm2 = confusion_matrix(y_true, y_pred_model2)
+
+# Plot confusion matrix for model 2
+disp2 = ConfusionMatrixDisplay(confusion_matrix=cm2, display_labels=['Healthy', 'Parkinson'])
+disp2.plot(cmap=plt.cm.Blues)
+plt.title('Confusion Matrix for Model 2')
+plt.show()
